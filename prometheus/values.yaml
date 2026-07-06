@@ -1,0 +1,208 @@
+grafana:
+  # GitOps trigger marker: keep this file touched for redeploys when needed.
+  enabled: true
+  replicas: 1
+
+  deploymentStrategy:
+    type: Recreate
+
+  ingress:
+    enabled: true
+    ingressClassName: nginx-internal
+    annotations:
+      kubernetes.io/ingress.class: nginx-internal
+    hosts:
+      - grafana.mysite.com
+    tls:
+      - hosts:
+          - grafana.mysite.com
+        secretName: mysite-com-tls
+
+  persistence:
+    enabled: true
+    size: 10Gi
+
+  image:
+    repository: grafana/grafana
+    tag: "12.4.3"
+
+  sidecar:
+    datasources:
+      enabled: false
+    alerts:
+      enabled: false
+
+  datasources:
+    datasources.yaml:
+      apiVersion: 1
+      datasources:
+        - name: Prometheus
+          type: prometheus
+          url: http://kube-prometheus-kube-prome-prometheus:9090
+          access: proxy
+          isDefault: true
+          jsonData:
+            manageAlerts: false
+
+        - name: Loki
+          type: loki
+          url: http://loki:3100
+          access: proxy
+          isDefault: false
+
+  extraSecretMounts:
+    - name: grafana-oauth-secret
+      secretName: grafana-oauth-secret
+      mountPath: /etc/secrets
+      readOnly: true
+
+  plugins:
+    - grafana-lokiexplore-app
+    - grafana-pyroscope-app
+    - grafana-exploretraces-app
+    - grafana-metricsdrilldown-app
+
+  extraConfigmapMounts:
+    - name: grafana-app-plugins
+      mountPath: /etc/grafana/provisioning/plugins
+      configMap: grafana-app-plugins
+      readOnly: true
+
+  extraObjects:
+    - apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: grafana-app-plugins
+        namespace: monitoring
+      data:
+        apps.yaml: |
+          apiVersion: 1
+          apps:
+            - type: grafana-lokiexplore-app
+              org_id: 1
+              disabled: false
+            - type: grafana-metricsdrilldown-app
+              org_id: 1
+              disabled: false
+            - type: grafana-exploretraces-app
+              org_id: 1
+              disabled: false
+            - type: grafana-pyroscope-app
+              org_id: 1
+              disabled: false
+
+  alerting:
+    rules.yaml:
+      apiVersion: 1
+      groups: []
+
+  grafana.ini:
+    feature_toggles:
+      enable: exploreMetrics exploreLogs exploreTraces exploreProfiles
+    unified_alerting:
+      enabled: true
+    users:
+      viewers_can_edit: true
+    server:
+      root_url: https://grafana.mysite.com
+
+    auth.generic_oauth:
+      enabled: true
+      name: AzureAD
+      client_id: ***********your azure client id*****************
+      client_secret: $__file{/etc/secrets/client_secret}
+      scopes: openid profile email
+      auth_url: https://login.microsoftonline.com/**************-00ea2de9bae7/oauth2/v2.0/authorize
+      token_url: https://login.microsoftonline.com/***************-00ea2de9bae7/oauth2/v2.0/token
+      api_url: https://graph.microsoft.com/oidc/userinfo
+      use_id_token: false
+      groups_attribute_path: groups
+      allow_assign_grafana_admin: true
+      role_attribute_strict: false
+      skip_org_role_sync: true
+      role_attribute_path: >
+        contains(groups[*], '*******************************') && 'GrafanaAdmin' ||
+        contains(groups[*], '*******************************') && 'Admin' ||
+        'Viewer'
+
+prometheus:
+  prometheusSpec:
+    retention: 2d
+
+    storageSpec:
+      volumeClaimTemplate:
+        spec:
+          accessModes: ["ReadWriteOnce"]
+          resources:
+            requests:
+              storage: 20Gi
+
+    additionalScrapeConfigs:
+      - job_name: 'kubernetes-pods'
+        kubernetes_sd_configs:
+          - role: pod
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_pod_label_app]
+            target_label: app
+
+  additionalPrometheusRulesMap:
+    aks-silences:
+      groups:
+        - name: aks-managed-overrides
+          rules:
+            - alert: KubeControllerManagerDown
+              expr: absent(up{job="kube-controller-manager"}) == 1
+              for: 999d
+              labels:
+                severity: none
+            - alert: KubeSchedulerDown
+              expr: absent(up{job="kube-scheduler"}) == 1
+              for: 999d
+              labels:
+                severity: none
+            - alert: KubeProxyDown
+              expr: absent(up{job="kube-proxy"}) == 1
+              for: 999d
+              labels:
+                severity: none
+
+    custom-rules:
+      groups:
+        - name: kubernetes.rules
+          rules:
+            - alert: PodCrashLooping
+              expr: increase(kube_pod_container_status_restarts_total[5m]) > 3
+              for: 2m
+              labels:
+                severity: warning
+                app: "alerts-infra"
+              annotations:
+                summary: "Pod is restarting frequently"
+
+            - alert: HighCPUUsage
+              expr: sum(rate(container_cpu_usage_seconds_total[5m])) > 0.8
+              for: 2m
+              labels:
+                severity: critical
+                app: "alerts-infra"
+              annotations:
+                summary: "High CPU usage detected"
+
+            - alert: NodeNotReady
+              expr: kube_node_status_condition{condition="Ready",status="true"} == 0
+              for: 2m
+              labels:
+                severity: critical
+                app: "alerts-infra"
+              annotations:
+                summary: "Node is not ready"
+
+alertmanager:
+  alertmanagerSpec:
+    storage:
+      volumeClaimTemplate:
+        spec:
+          accessModes: ["ReadWriteOnce"]
+          resources:
+            requests:
+              storage: 5Gi
