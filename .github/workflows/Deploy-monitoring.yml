@@ -1,0 +1,117 @@
+name: Deploy Monitoring (Prod)
+
+on:
+  workflow_dispatch:
+    inputs:
+      deploy_all:
+        description: "If true, deploy Loki, kube-prometheus, and Alloy regardless of which files changed. If false (default), only deploy stacks touched in the triggering commit."
+        type: boolean
+        default: false
+
+env:
+  CLUSTER_NAME: my-prod-aks
+  RESOURCE_GROUP: my-prod-apps-rg
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.sha }}
+
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Set AKS Context
+        uses: azure/aks-set-context@v4
+        with:
+          resource-group: ${{ env.RESOURCE_GROUP }}
+          cluster-name: ${{ env.CLUSTER_NAME }}
+
+      - name: Setup Helm
+        uses: azure/setup-helm@v4.3.0
+
+      - name: Add Helm repos
+        run: |
+          helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+          helm repo add grafana https://grafana.github.io/helm-charts
+          helm repo update
+
+      - name: Detect changed components
+        id: changes
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event.inputs.deploy_all }}" = "true" ]; then
+            echo "deploy_all=true: deploying all components"
+            deploy_loki=true
+            deploy_prometheus=true
+            deploy_alloy=true
+          else
+            # Use the exact triggering commit (works for merge commits; avoids HEAD^..HEAD drift).
+            SHA="${GITHUB_SHA:-$(git rev-parse HEAD)}"
+            echo "Selective deploy for commit: $SHA"
+            git log -1 --oneline "$SHA" || true
+            CHANGED_FILES="$(git diff-tree --no-commit-id --name-only -r "$SHA" | sed 's|^\./||' | sort -u)"
+            echo "Changed files in this commit only:"
+            echo "$CHANGED_FILES"
+            deploy_loki=false
+            deploy_prometheus=false
+            deploy_alloy=false
+            if echo "$CHANGED_FILES" | grep -Eq '^loki/|^\.github/workflows/deploy-monitoring\.yml$'; then
+              deploy_loki=true
+            fi
+            if echo "$CHANGED_FILES" | grep -Eq '^prometheus/|^\.github/workflows/deploy-monitoring\.yml$'; then
+              deploy_prometheus=true
+            fi
+            if echo "$CHANGED_FILES" | grep -Eq '^alloy/|^\.github/workflows/deploy-monitoring\.yml$'; then
+              deploy_alloy=true
+            fi
+            if [ "$deploy_loki" = false ] && [ "$deploy_prometheus" = false ] && [ "$deploy_alloy" = false ]; then
+              echo "No matching paths in this commit; nothing to deploy. Set deploy_all=true to run everything."
+            fi
+          fi
+          echo "deploy_loki=$deploy_loki" >> "$GITHUB_OUTPUT"
+          echo "deploy_prometheus=$deploy_prometheus" >> "$GITHUB_OUTPUT"
+          echo "deploy_alloy=$deploy_alloy" >> "$GITHUB_OUTPUT"
+
+      - name: Print deployment plan
+        run: |
+          echo "deploy_all input: ${{ github.event.inputs.deploy_all }}"
+          echo "Deploy Loki: ${{ steps.changes.outputs.deploy_loki }}"
+          echo "Deploy Prometheus: ${{ steps.changes.outputs.deploy_prometheus }}"
+          echo "Deploy Alloy: ${{ steps.changes.outputs.deploy_alloy }}"
+
+      - name: Deploy Loki
+        if: steps.changes.outputs.deploy_loki == 'true'
+        run: |
+          helm upgrade --install loki grafana/loki-stack \
+            --version 2.10.3 \
+            --reset-values \
+            --namespace monitoring \
+            -f loki/values.yaml \
+            --wait --timeout 5m --rollback-on-failure
+
+      - name: Deploy Prometheus Stack
+        if: steps.changes.outputs.deploy_prometheus == 'true'
+        run: |
+          helm upgrade --install kube-prometheus prometheus-community/kube-prometheus-stack \
+            --namespace monitoring \
+            --create-namespace \
+            -f prometheus/values.yaml \
+            --wait --timeout 5m --rollback-on-failure
+
+      - name: Deploy Alloy
+        if: steps.changes.outputs.deploy_alloy == 'true'
+        run: |
+          helm upgrade --install alloy grafana/alloy \
+            --version 1.7.0 \
+            --namespace monitoring \
+            -f alloy/values.yaml \
+            --wait --timeout 5m --rollback-on-failure
